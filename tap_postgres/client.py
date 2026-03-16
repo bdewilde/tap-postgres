@@ -31,6 +31,8 @@ if t.TYPE_CHECKING:
     from sqlalchemy.engine.reflection import Inspector
 
     from tap_postgres.connection_parameters import ConnectionParameters
+    from tap_postgres.tap import TapPostgres
+    from tap_postgres.wal_prefetcher import WALPrefetcher
 
 
 def _now_utc() -> str:
@@ -284,6 +286,30 @@ class PostgresLogBasedStream(SQLStream):
             state_dict["replication_key_value"] = new_value
 
     def get_records(self, context: Context | None) -> Iterable[dict[str, t.Any]]:
+        """Yield records from the WAL, either prefetched or direct.
+
+        Asks the tap for a shared :class:`WALPrefetcher`.  If one exists
+        (i.e. there are LOG_BASED streams), drain its buffer; otherwise
+        fall back to per-stream replication directly from the WAL.
+        """
+        tap = t.cast("TapPostgres", self._tap)
+        prefetcher = tap.get_wal_prefetcher()
+        if prefetcher is not None:
+            yield from self._get_records_from_prefetch(prefetcher, context)
+        yield from self._get_records_from_db(context)
+
+    def _get_records_from_prefetch(
+        self, prefetcher: WALPrefetcher, context: Context | None
+    ) -> Iterable[dict[str, t.Any]]:
+        """Drain records from the :class:`WALPrefetcher` buffer."""
+        # TODO: verify that str(fully_qualified_name) produces "schema.table"
+        # matching format used by WALPrefetcher._handle_message() as buffer keys
+        for message in prefetcher.get_messages(str(self.fully_qualified_name)):
+            row = prefetcher.consume(message.payload, message.lsn)
+            if row:
+                yield row
+
+    def _get_records_from_db(self, context: Context | None) -> Iterable[dict[str, t.Any]]:
         """Return a generator of row-type dictionary objects."""
         status_interval = 5  # if no records in 5 seconds the tap can exit
         start_lsn = self.get_starting_replication_key_value(context=context)
