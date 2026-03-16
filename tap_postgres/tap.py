@@ -29,6 +29,8 @@ from tap_postgres.connection_parameters import ConnectionParameters
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from tap_postgres.wal_prefetcher import StreamWALConfig, WALPrefetcher
+
 # Try to import MsgSpecWriter for better performance
 try:
     from singer_sdk.contrib.msgspec import MsgSpecWriter
@@ -207,6 +209,8 @@ class TapPostgres(SQLTap):
     name = "tap-postgres"
     package_name = "meltanolabs-tap-postgres"
     default_stream_class = PostgresStream
+    _wal_prefetcher: WALPrefetcher | None = None
+    _wal_prefetch_attempted: bool = False
 
     # Use MsgSpecWriter if available for ~15-20% performance improvement
     if _MSGSPEC_AVAILABLE:
@@ -733,3 +737,117 @@ class TapPostgres(SQLTap):
             else:
                 streams.append(PostgresStream(self, catalog_entry, connector=connector))
         return streams
+
+    def get_wal_prefetcher(self) -> WALPrefetcher | None:
+        """Get shared WAL prefetcher, and initialize it on first call.
+
+        Called by :meth:`PostgresLogBasedStream.get_records` on each
+        LOG_BASED stream.  The first call collects *all* LOG_BASED
+        streams, builds and runs a :class:`WALPrefetcher` that reads
+        the WAL once for all of them, and caches the result.  Subsequent
+        calls return the cached prefetcher immediately.
+
+        Returns ``None`` if there are no LOG_BASED streams (in which
+        case the caller falls back to the legacy per-stream path).
+        """
+        if self._wal_prefetch_attempted:
+            return self._wal_prefetcher
+
+        self._wal_prefetch_attempted = True
+
+        log_based_streams: list[PostgresLogBasedStream] = [
+            stream for stream in self.streams.values() if isinstance(stream, PostgresLogBasedStream)
+        ]
+        if not log_based_streams:
+            return None
+
+        # Build per-stream WAL config from existing state bookmarks.
+        # str(fully_qualified_name) must produce "schema.table" matching
+        # the format that WALPrefetcher._handle_message() uses as keys.
+        streams_config: dict[str, StreamWALConfig] = {}
+        for stream in log_based_streams:
+            table_fqn = str(stream.fully_qualified_name)
+            start_lsn = stream.get_starting_replication_key_value(
+                context=None,
+            )
+            streams_config[table_fqn] = StreamWALConfig(
+                table_fqn=table_fqn,
+                start_lsn=start_lsn if start_lsn is not None else 0,
+            )
+
+        # All LOG_BASED streams share the same connection parameters.
+        connection_parameters = log_based_streams[0].connection_parameters
+        replication_slot_name = self.config.get(
+            "replication_slot_name",
+            "tappostgres",
+        )
+
+        self._wal_prefetcher = WALPrefetcher(
+            connection_parameters=connection_parameters,
+            streams=streams_config,
+            replication_slot_name=replication_slot_name,
+        )
+
+        self.logger.info(
+            "Running single-pass WAL prefetch for %d LOG_BASED stream(s): %s",
+            len(log_based_streams),
+            sorted(streams_config.keys()),
+        )
+        self._wal_prefetcher.run()
+
+        return self._wal_prefetcher
+
+    def _prefetch_wal_if_needed(self) -> None:
+        """Run single-pass WAL prefetch for all LOG_BASED streams.
+
+        Collects every :class:`PostgresLogBasedStream` in the discovered
+        stream list, builds a :class:`StreamWALConfig` for each (reading
+        the start LSN from the stream's existing state bookmark), runs
+        the prefetcher, and attaches it to each stream so that
+        ``get_records()`` drains the buffer instead of opening its own
+        replication connection.
+
+        No-ops if there are no LOG_BASED streams.
+        """
+        log_based_streams: list[PostgresLogBasedStream] = [
+            stream for stream in self.streams.values() if isinstance(stream, PostgresLogBasedStream)
+        ]
+
+        if not log_based_streams:
+            return
+
+        # Build per-stream WAL config from existing state bookmarks.
+        # str(fully_qualified_name) must produce "schema.table" matching
+        # the format that WALPrefetcher._handle_message() uses as keys.
+        streams_config: dict[str, StreamWALConfig] = {}
+        for stream in log_based_streams:
+            table_fqn = str(stream.fully_qualified_name)
+            start_lsn = stream.get_starting_replication_key_value(
+                context=None,
+            )
+            streams_config[table_fqn] = StreamWALConfig(
+                table_fqn=table_fqn,
+                start_lsn=start_lsn if start_lsn is not None else 0,
+            )
+
+        # All LOG_BASED streams share the same connection parameters.
+        connection_parameters = log_based_streams[0].connection_parameters
+        replication_slot_name = self.config.get("replication_slot_name", "tappostgres")
+
+        prefetcher = WALPrefetcher(
+            connection_parameters=connection_parameters,
+            streams=streams_config,
+            replication_slot_name=replication_slot_name,
+        )
+
+        self.logger.info(
+            "Running single-pass WAL prefetch for %d LOG_BASED stream(s): %s",
+            len(log_based_streams),
+            sorted(streams_config.keys()),
+        )
+        prefetcher.run()
+
+        # Attach the prefetcher to each stream so get_records()
+        # drains the buffer instead of opening its own connection.
+        for stream in log_based_streams:
+            stream._wal_prefetcher = prefetcher
